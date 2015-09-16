@@ -17,6 +17,7 @@ import (
 	"github.com/docker/docker/pkg/progressreader"
 	"github.com/docker/docker/pkg/streamformatter"
 	"github.com/docker/docker/pkg/stringid"
+	"github.com/docker/docker/pkg/transport"
 	"github.com/docker/docker/registry"
 	"github.com/docker/docker/utils"
 )
@@ -54,20 +55,41 @@ func (s *TagStore) Pull(image string, tag string, imagePullConfig *ImagePullConf
 	}
 	defer s.poolRemove("pull", utils.ImageReference(repoInfo.LocalName, tag))
 
-	logrus.Debugf("pulling image from host %q with remote name %q", repoInfo.Index.Name, repoInfo.RemoteName)
-	endpoint, err := repoInfo.GetEndpoint()
-	if err != nil {
-		return err
-	}
-
-	r, err := registry.NewSession(imagePullConfig.AuthConfig, registry.HTTPRequestFactory(imagePullConfig.MetaHeaders), endpoint, true)
-	if err != nil {
-		return err
-	}
-
 	logName := repoInfo.LocalName
 	if tag != "" {
 		logName = utils.ImageReference(logName, tag)
+	}
+
+	// Attempt pulling official content from a provided v2 mirror
+	if repoInfo.Index.Official {
+		v2mirrorEndpoint, v2mirrorRepoInfo, err := configureV2Mirror(repoInfo, s.registryService)
+		if err != nil {
+			logrus.Errorf("Error configuring mirrors: %s", err)
+			return err
+		}
+
+		if v2mirrorEndpoint != nil {
+			logrus.Debugf("Attempting to pull from v2 mirror: %s", v2mirrorEndpoint.URL)
+			return s.pullFromV2Mirror(v2mirrorEndpoint, v2mirrorRepoInfo, imagePullConfig, tag, sf, logName)
+		}
+	}
+
+	logrus.Debugf("pulling image from host %q with remote name %q", repoInfo.Index.Name, repoInfo.RemoteName)
+
+	endpoint, err := repoInfo.GetEndpoint(imagePullConfig.MetaHeaders)
+	if err != nil {
+		return err
+	}
+	// TODO(tiborvass): reuse client from endpoint?
+	// Adds Docker-specific headers as well as user-specified headers (metaHeaders)
+	tr := transport.NewTransport(
+		registry.NewTransport(registry.ReceiveTimeout, endpoint.IsSecure),
+		registry.DockerHeaders(imagePullConfig.MetaHeaders)...,
+	)
+	client := registry.HTTPClient(tr)
+	r, err := registry.NewSession(client, imagePullConfig.AuthConfig, endpoint)
+	if err != nil {
+		return err
 	}
 
 	if len(repoInfo.Index.Mirrors) == 0 && (repoInfo.Index.Official || endpoint.Version == registry.APIVersion2) {
@@ -86,6 +108,10 @@ func (s *TagStore) Pull(image string, tag string, imagePullConfig *ImagePullConf
 		logrus.Debug("image does not exist on v2 registry, falling back to v1")
 	}
 
+	if utils.DigestReference(tag) {
+		return fmt.Errorf("pulling with digest reference failed from v2 registry")
+	}
+
 	logrus.Debugf("pulling v1 repository with local name %q", repoInfo.LocalName)
 	if err = s.pullRepository(r, imagePullConfig.OutStream, repoInfo, tag, sf); err != nil {
 		return err
@@ -93,6 +119,90 @@ func (s *TagStore) Pull(image string, tag string, imagePullConfig *ImagePullConf
 
 	s.eventsService.Log("pull", logName, "")
 
+	return nil
+
+}
+
+func makeMirrorRepoInfo(repoInfo *registry.RepositoryInfo, mirror string) *registry.RepositoryInfo {
+	mirrorRepo := &registry.RepositoryInfo{
+		RemoteName:    repoInfo.RemoteName,
+		LocalName:     repoInfo.LocalName,
+		CanonicalName: repoInfo.CanonicalName,
+		Official:      false,
+
+		Index: &registry.IndexInfo{
+			Official: false,
+			Secure:   repoInfo.Index.Secure,
+			Name:     mirror,
+			Mirrors:  []string{},
+		},
+	}
+	return mirrorRepo
+}
+
+func configureV2Mirror(repoInfo *registry.RepositoryInfo, s *registry.Service) (*registry.Endpoint, *registry.RepositoryInfo, error) {
+	mirrors := repoInfo.Index.Mirrors
+	if len(mirrors) == 0 {
+		// no mirrors configured
+		return nil, nil, nil
+	}
+
+	v1MirrorCount := 0
+	var v2MirrorEndpoint *registry.Endpoint
+	var v2MirrorRepoInfo *registry.RepositoryInfo
+	for _, mirror := range mirrors {
+		mirrorRepoInfo := makeMirrorRepoInfo(repoInfo, mirror)
+		endpoint, err := registry.NewEndpoint(mirrorRepoInfo.Index, nil)
+		if err != nil {
+			logrus.Errorf("Unable to create endpoint for %s: %s", mirror, err)
+			continue
+		}
+		if endpoint.Version == 2 {
+			if v2MirrorEndpoint == nil {
+				v2MirrorEndpoint = endpoint
+				v2MirrorRepoInfo = mirrorRepoInfo
+			} else {
+				// > 1 v2 mirrors given
+				return nil, nil, fmt.Errorf("multiple v2 mirrors configured")
+			}
+		} else {
+			v1MirrorCount++
+		}
+	}
+
+	if v1MirrorCount == len(mirrors) {
+		// OK, but mirrors are v1
+		return nil, nil, nil
+	}
+	if v2MirrorEndpoint != nil && v1MirrorCount == 0 {
+		// OK, 1 v2 mirror specified
+		return v2MirrorEndpoint, v2MirrorRepoInfo, nil
+	}
+	if v2MirrorEndpoint != nil && v1MirrorCount > 0 {
+		return nil, nil, fmt.Errorf("v1 and v2 mirrors configured")
+	}
+	// No endpoint could be established with the given mirror configurations
+	// Fallback to pulling from the hub as per v1 behavior.
+	return nil, nil, nil
+}
+
+func (s *TagStore) pullFromV2Mirror(mirrorEndpoint *registry.Endpoint, repoInfo *registry.RepositoryInfo,
+	imagePullConfig *ImagePullConfig, tag string, sf *streamformatter.StreamFormatter, logName string) error {
+
+	tr := transport.NewTransport(
+		registry.NewTransport(registry.ReceiveTimeout, mirrorEndpoint.IsSecure),
+		registry.DockerHeaders(imagePullConfig.MetaHeaders)...,
+	)
+	client := registry.HTTPClient(tr)
+	mirrorSession, err := registry.NewSession(client, &cliconfig.AuthConfig{}, mirrorEndpoint)
+	if err != nil {
+		return err
+	}
+	logrus.Debugf("Pulling v2 repository with local name %q from %s", repoInfo.LocalName, mirrorEndpoint.URL)
+	if err := s.pullV2Repository(mirrorSession, imagePullConfig.OutStream, repoInfo, tag, sf); err != nil {
+		return err
+	}
+	s.eventsService.Log("pull", logName, "")
 	return nil
 }
 
@@ -109,7 +219,7 @@ func (s *TagStore) pullRepository(r *registry.Session, out io.Writer, repoInfo *
 	}
 
 	logrus.Debugf("Retrieving the tag list")
-	tagsList, err := r.GetRemoteTags(repoData.Endpoints, repoInfo.RemoteName, repoData.Tokens)
+	tagsList, err := r.GetRemoteTags(repoData.Endpoints, repoInfo.RemoteName)
 	if err != nil {
 		logrus.Errorf("unable to get remote tags: %s", err)
 		return err
@@ -173,6 +283,8 @@ func (s *TagStore) pullRepository(r *registry.Session, out io.Writer, repoInfo *
 			var lastErr, err error
 			var isDownloaded bool
 			for _, ep := range repoInfo.Index.Mirrors {
+				// Ensure endpoint is v1
+				ep = ep + "v1/"
 				out.Write(sf.FormatProgress(stringid.TruncateID(img.ID), fmt.Sprintf("Pulling image (%s) from %s, mirror: %s", img.Tag, repoInfo.CanonicalName, ep), nil))
 				if isDownloaded, err = s.pullImage(r, out, img.ID, ep, repoData.Tokens, sf); err != nil {
 					// Don't report errors when pulling from mirrors.
@@ -240,7 +352,7 @@ func (s *TagStore) pullRepository(r *registry.Session, out io.Writer, repoInfo *
 }
 
 func (s *TagStore) pullImage(r *registry.Session, out io.Writer, imgID, endpoint string, token []string, sf *streamformatter.StreamFormatter) (bool, error) {
-	history, err := r.GetRemoteHistory(imgID, endpoint, token)
+	history, err := r.GetRemoteHistory(imgID, endpoint)
 	if err != nil {
 		return false, err
 	}
@@ -269,7 +381,7 @@ func (s *TagStore) pullImage(r *registry.Session, out io.Writer, imgID, endpoint
 			)
 			retries := 5
 			for j := 1; j <= retries; j++ {
-				imgJSON, imgSize, err = r.GetRemoteImageJSON(id, endpoint, token)
+				imgJSON, imgSize, err = r.GetRemoteImageJSON(id, endpoint)
 				if err != nil && j == retries {
 					out.Write(sf.FormatProgress(stringid.TruncateID(id), "Error pulling dependent layers", nil))
 					return layersDownloaded, err
@@ -297,7 +409,7 @@ func (s *TagStore) pullImage(r *registry.Session, out io.Writer, imgID, endpoint
 					status = fmt.Sprintf("Pulling fs layer [retries: %d]", j)
 				}
 				out.Write(sf.FormatProgress(stringid.TruncateID(id), status, nil))
-				layer, err := r.GetRemoteImageLayer(img.ID, endpoint, token, int64(imgSize))
+				layer, err := r.GetRemoteImageLayer(img.ID, endpoint, int64(imgSize))
 				if uerr, ok := err.(*url.Error); ok {
 					err = uerr.Err
 				}
@@ -343,17 +455,6 @@ func WriteStatus(requestedTag string, out io.Writer, sf *streamformatter.StreamF
 	} else {
 		out.Write(sf.FormatStatus("", "Status: Image is up to date for %s", requestedTag))
 	}
-}
-
-// downloadInfo is used to pass information from download to extractor
-type downloadInfo struct {
-	imgJSON    []byte
-	img        *image.Image
-	digest     digest.Digest
-	tmpFile    *os.File
-	length     int64
-	downloaded bool
-	err        chan error
 }
 
 func (s *TagStore) pullV2Repository(r *registry.Session, out io.Writer, repoInfo *registry.RepositoryInfo, tag string, sf *streamformatter.StreamFormatter) error {
@@ -405,26 +506,33 @@ func (s *TagStore) pullV2Repository(r *registry.Session, out io.Writer, repoInfo
 func (s *TagStore) pullV2Tag(r *registry.Session, out io.Writer, endpoint *registry.Endpoint, repoInfo *registry.RepositoryInfo, tag string, sf *streamformatter.StreamFormatter, auth *registry.RequestAuthorization) (bool, error) {
 	logrus.Debugf("Pulling tag from V2 registry: %q", tag)
 
-	manifestBytes, manifestDigest, err := r.GetV2ImageManifest(endpoint, repoInfo.RemoteName, tag, auth)
+	remoteDigest, manifestBytes, err := r.GetV2ImageManifest(endpoint, repoInfo.RemoteName, tag, auth)
 	if err != nil {
 		return false, err
 	}
 
 	// loadManifest ensures that the manifest payload has the expected digest
 	// if the tag is a digest reference.
-	manifest, verified, err := s.loadManifest(manifestBytes, manifestDigest, tag)
+	localDigest, manifest, verified, err := s.loadManifest(manifestBytes, tag, remoteDigest)
 	if err != nil {
 		return false, fmt.Errorf("error verifying manifest: %s", err)
-	}
-
-	if err := checkValidManifest(manifest); err != nil {
-		return false, err
 	}
 
 	if verified {
 		logrus.Printf("Image manifest for %s has been verified", utils.ImageReference(repoInfo.CanonicalName, tag))
 	}
 	out.Write(sf.FormatStatus(tag, "Pulling from %s", repoInfo.CanonicalName))
+
+	// downloadInfo is used to pass information from download to extractor
+	type downloadInfo struct {
+		imgJSON    []byte
+		img        *image.Image
+		digest     digest.Digest
+		tmpFile    *os.File
+		length     int64
+		downloaded bool
+		err        chan error
+	}
 
 	downloads := make([]downloadInfo, len(manifest.FSLayers))
 
@@ -498,8 +606,7 @@ func (s *TagStore) pullV2Tag(r *registry.Session, out io.Writer, endpoint *regis
 				out.Write(sf.FormatProgress(stringid.TruncateID(img.ID), "Verifying Checksum", nil))
 
 				if !verifier.Verified() {
-					logrus.Infof("Image verification failed: checksum mismatch for %q", di.digest.String())
-					verified = false
+					return fmt.Errorf("image layer digest verification failed for %q", di.digest)
 				}
 
 				out.Write(sf.FormatProgress(stringid.TruncateID(img.ID), "Download complete", nil))
@@ -547,6 +654,10 @@ func (s *TagStore) pullV2Tag(r *registry.Session, out io.Writer, endpoint *regis
 					return false, err
 				}
 
+				if err := d.img.SaveCheckSum(s.graph.ImageRoot(d.img.ID), d.digest.String()); err != nil {
+					return false, err
+				}
+
 				// FIXME: Pool release here for parallel tag pull (ensures any downloads block until fully extracted)
 			}
 			out.Write(sf.FormatProgress(stringid.TruncateID(d.img.ID), "Pull complete", nil))
@@ -576,15 +687,33 @@ func (s *TagStore) pullV2Tag(r *registry.Session, out io.Writer, endpoint *regis
 		out.Write(sf.FormatStatus(utils.ImageReference(repoInfo.CanonicalName, tag), "The image you are pulling has been verified. Important: image verification is a tech preview feature and should not be relied on to provide security."))
 	}
 
-	if manifestDigest != "" {
-		out.Write(sf.FormatStatus("", "Digest: %s", manifestDigest))
+	if localDigest != remoteDigest { // this is not a verification check.
+		// NOTE(stevvooe): This is a very defensive branch and should never
+		// happen, since all manifest digest implementations use the same
+		// algorithm.
+		logrus.WithFields(
+			logrus.Fields{
+				"local":  localDigest,
+				"remote": remoteDigest,
+			}).Debugf("local digest does not match remote")
+
+		out.Write(sf.FormatStatus("", "Remote Digest: %s", remoteDigest))
 	}
 
-	if utils.DigestReference(tag) {
-		if err = s.SetDigest(repoInfo.LocalName, tag, downloads[0].img.ID); err != nil {
+	out.Write(sf.FormatStatus("", "Digest: %s", localDigest))
+
+	if tag == localDigest.String() {
+		// TODO(stevvooe): Ideally, we should always set the digest so we can
+		// use the digest whether we pull by it or not. Unfortunately, the tag
+		// store treats the digest as a separate tag, meaning there may be an
+		// untagged digest image that would seem to be dangling by a user.
+
+		if err = s.SetDigest(repoInfo.LocalName, localDigest.String(), downloads[0].img.ID); err != nil {
 			return false, err
 		}
-	} else {
+	}
+
+	if !utils.DigestReference(tag) {
 		// only set the repository/tag -> image ID mapping when pulling by tag (i.e. not by digest)
 		if err = s.Tag(repoInfo.LocalName, tag, downloads[0].img.ID, true); err != nil {
 			return false, err

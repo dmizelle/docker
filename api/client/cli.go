@@ -6,19 +6,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
-	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"text/template"
-	"time"
 
 	"github.com/docker/docker/cliconfig"
 	"github.com/docker/docker/pkg/homedir"
 	flag "github.com/docker/docker/pkg/mflag"
 	"github.com/docker/docker/pkg/term"
+	"github.com/docker/docker/utils"
 )
 
 // DockerCli represents the docker command line client.
@@ -98,7 +96,7 @@ func (cli *DockerCli) Cmd(args ...string) error {
 	if len(args) > 0 {
 		method, exists := cli.getMethod(args[0])
 		if !exists {
-			return fmt.Errorf("docker: '%s' is not a docker command. See 'docker --help'.", args[0])
+			return fmt.Errorf("docker: '%s' is not a docker command.\nSee 'docker --help'.", args[0])
 		}
 		return method(args[1:]...)
 	}
@@ -118,18 +116,19 @@ func (cli *DockerCli) Subcmd(name, signature, description string, exitOnError bo
 		errorHandling = flag.ContinueOnError
 	}
 	flags := flag.NewFlagSet(name, errorHandling)
+	if signature != "" {
+		signature = " " + signature
+	}
 	flags.Usage = func() {
+		flags.ShortUsage()
+		flags.PrintDefaults()
+	}
+	flags.ShortUsage = func() {
 		options := ""
-		if signature != "" {
-			signature = " " + signature
-		}
 		if flags.FlagCountUndeprecated() > 0 {
 			options = " [OPTIONS]"
 		}
-		fmt.Fprintf(cli.out, "\nUsage: docker %s%s%s\n\n%s\n\n", name, options, signature, description)
-		flags.SetOutput(cli.out)
-		flags.PrintDefaults()
-		os.Exit(0)
+		fmt.Fprintf(flags.Out(), "\nUsage: docker %s%s%s\n\n%s\n", name, options, signature, description)
 	}
 	return flags
 }
@@ -178,19 +177,7 @@ func NewDockerCli(in io.ReadCloser, out, err io.Writer, keyFile string, proto, a
 	tr := &http.Transport{
 		TLSClientConfig: tlsConfig,
 	}
-
-	// Why 32? See https://github.com/docker/docker/pull/8035.
-	timeout := 32 * time.Second
-	if proto == "unix" {
-		// No need for compression in local communications.
-		tr.DisableCompression = true
-		tr.Dial = func(_, _ string) (net.Conn, error) {
-			return net.DialTimeout(proto, addr, timeout)
-		}
-	} else {
-		tr.Proxy = http.ProxyFromEnvironment
-		tr.Dial = (&net.Dialer{Timeout: timeout}).Dial
-	}
+	utils.ConfigureTCPTransport(tr, proto, addr)
 
 	configFile, e := cliconfig.Load(filepath.Join(homedir.Get(), ".docker"))
 	if e != nil {

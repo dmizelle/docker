@@ -10,6 +10,10 @@ import (
 type ContainerJSONRaw struct {
 	*Container
 	HostConfig *runconfig.HostConfig
+
+	// Unused fields for backward compatibility with API versions < 1.12.
+	Volumes   map[string]string
+	VolumesRW map[string]bool
 }
 
 func (daemon *Daemon) ContainerInspect(name string) (*types.ContainerJSON, error) {
@@ -21,6 +25,40 @@ func (daemon *Daemon) ContainerInspect(name string) (*types.ContainerJSON, error
 	container.Lock()
 	defer container.Unlock()
 
+	base, err := daemon.getInspectData(container)
+	if err != nil {
+		return nil, err
+	}
+
+	return &types.ContainerJSON{base, container.Config}, nil
+}
+
+func (daemon *Daemon) ContainerInspectRaw(name string) (*types.ContainerJSONRaw, error) {
+	container, err := daemon.Get(name)
+	if err != nil {
+		return nil, err
+	}
+
+	container.Lock()
+	defer container.Unlock()
+
+	base, err := daemon.getInspectData(container)
+	if err != nil {
+		return nil, err
+	}
+
+	config := &types.ContainerConfig{
+		container.Config,
+		container.hostConfig.Memory,
+		container.hostConfig.MemorySwap,
+		container.hostConfig.CpuShares,
+		container.hostConfig.CpusetCpus,
+	}
+
+	return &types.ContainerJSONRaw{base, config}, nil
+}
+
+func (daemon *Daemon) getInspectData(container *Container) (*types.ContainerJSONBase, error) {
 	// make a copy to play with
 	hostConfig := *container.hostConfig
 
@@ -48,12 +86,19 @@ func (daemon *Daemon) ContainerInspect(name string) (*types.ContainerJSON, error
 		FinishedAt: container.State.FinishedAt,
 	}
 
-	contJSON := &types.ContainerJSON{
+	volumes := make(map[string]string)
+	volumesRW := make(map[string]bool)
+
+	for _, m := range container.MountPoints {
+		volumes[m.Destination] = m.Path()
+		volumesRW[m.Destination] = m.RW
+	}
+
+	contJSONBase := &types.ContainerJSONBase{
 		Id:              container.ID,
 		Created:         container.Created,
 		Path:            container.Path,
 		Args:            container.Args,
-		Config:          container.Config,
 		State:           containerState,
 		Image:           container.ImageID,
 		NetworkSettings: container.NetworkSettings,
@@ -67,14 +112,14 @@ func (daemon *Daemon) ContainerInspect(name string) (*types.ContainerJSON, error
 		ExecDriver:      container.ExecDriver,
 		MountLabel:      container.MountLabel,
 		ProcessLabel:    container.ProcessLabel,
-		Volumes:         container.Volumes,
-		VolumesRW:       container.VolumesRW,
+		Volumes:         volumes,
+		VolumesRW:       volumesRW,
 		AppArmorProfile: container.AppArmorProfile,
 		ExecIDs:         container.GetExecIDs(),
 		HostConfig:      &hostConfig,
 	}
 
-	return contJSON, nil
+	return contJSONBase, nil
 }
 
 func (daemon *Daemon) ContainerExecInspect(id string) (*execConfig, error) {

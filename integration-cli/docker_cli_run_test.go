@@ -19,7 +19,7 @@ import (
 	"time"
 
 	"github.com/docker/docker/nat"
-	"github.com/docker/docker/pkg/resolvconf"
+	"github.com/docker/libnetwork/resolvconf"
 	"github.com/go-check/check"
 )
 
@@ -53,6 +53,7 @@ func (s *DockerSuite) TestRunEchoStdoutWithMemoryLimit(c *check.C) {
 
 // should run without memory swap
 func (s *DockerSuite) TestRunWithoutMemoryswapLimit(c *check.C) {
+	testRequires(c, NativeExecDriver)
 	runCmd := exec.Command(dockerBinary, "run", "-m", "16m", "--memory-swap", "-1", "busybox", "true")
 	out, _, err := runCommandWithOutput(runCmd)
 	if err != nil {
@@ -119,10 +120,6 @@ func (s *DockerSuite) TestRunEchoNamedContainer(c *check.C) {
 
 	if out != "test\n" {
 		c.Errorf("container should've printed 'test'")
-	}
-
-	if err := deleteContainer("testfoonamedcontainer"); err != nil {
-		c.Errorf("failed to remove the named container: %v", err)
 	}
 }
 
@@ -399,21 +396,6 @@ func (s *DockerSuite) TestRunModeNetContainerHostname(c *check.C) {
 	}
 }
 
-// Regression test for #4741
-func (s *DockerSuite) TestRunWithVolumesAsFiles(c *check.C) {
-	runCmd := exec.Command(dockerBinary, "run", "--name", "test-data", "--volume", "/etc/hosts:/target-file", "busybox", "true")
-	out, stderr, exitCode, err := runCommandWithStdoutStderr(runCmd)
-	if err != nil && exitCode != 0 {
-		c.Fatal("1", out, stderr, err)
-	}
-
-	runCmd = exec.Command(dockerBinary, "run", "--volumes-from", "test-data", "busybox", "cat", "/target-file")
-	out, stderr, exitCode, err = runCommandWithStdoutStderr(runCmd)
-	if err != nil && exitCode != 0 {
-		c.Fatal("2", out, stderr, err)
-	}
-}
-
 // Regression test for #4979
 func (s *DockerSuite) TestRunWithVolumesFromExited(c *check.C) {
 	runCmd := exec.Command(dockerBinary, "run", "--name", "test-data", "--volume", "/some/dir", "busybox", "touch", "/some/dir/file")
@@ -456,14 +438,6 @@ func (s *DockerSuite) TestRunCreateVolumesInSymlinkDir(c *check.C) {
 	out, _, err := runCommandWithOutput(exec.Command(dockerBinary, "run", "-v", "/test/test", name))
 	if err != nil {
 		c.Fatalf("Failed with errors: %s, %v", out, err)
-	}
-}
-
-// Regression test for #4830
-func (s *DockerSuite) TestRunWithRelativePath(c *check.C) {
-	runCmd := exec.Command(dockerBinary, "run", "-v", "tmp:/other-tmp", "busybox", "true")
-	if _, _, _, err := runCommandWithStdoutStderr(runCmd); err == nil {
-		c.Fatalf("relative path should result in an error")
 	}
 }
 
@@ -540,7 +514,7 @@ func (s *DockerSuite) TestRunNoDupVolumes(c *check.C) {
 	if out, _, err := runCommandWithOutput(cmd); err == nil {
 		c.Fatal("Expected error about duplicate volume definitions")
 	} else {
-		if !strings.Contains(out, "Duplicate volume") {
+		if !strings.Contains(out, "Duplicate bind mount") {
 			c.Fatalf("Expected 'duplicate volume' error, got %v", err)
 		}
 	}
@@ -1459,14 +1433,38 @@ func (s *DockerSuite) TestRunDnsOptionsBasedOnHostResolvConf(c *check.C) {
 	}
 }
 
-// Test the file watch notifier on docker host's /etc/resolv.conf
-// A go-routine is responsible for auto-updating containers which are
-// stopped and have an unmodified copy of resolv.conf, as well as
-// marking running containers as requiring an update on next restart
-func (s *DockerSuite) TestRunResolvconfUpdater(c *check.C) {
-	// Because overlay doesn't support inotify properly, we need to skip
-	// this test if the docker daemon has Storage Driver == overlay
-	testRequires(c, SameHostDaemon, NotOverlay)
+// Test to see if a non-root user can resolve a DNS name and reach out to it. Also
+// check if the container resolv.conf file has atleast 0644 perm.
+func (s *DockerSuite) TestRunNonRootUserResolvName(c *check.C) {
+	testRequires(c, SameHostDaemon)
+	testRequires(c, Network)
+
+	cmd := exec.Command(dockerBinary, "run", "--name=testperm", "--user=default", "busybox", "ping", "-c", "1", "www.docker.io")
+	if out, err := runCommand(cmd); err != nil {
+		c.Fatal(err, out)
+	}
+
+	cID, err := getIDByName("testperm")
+	if err != nil {
+		c.Fatal(err)
+	}
+
+	fmode := (os.FileMode)(0644)
+	finfo, err := os.Stat(containerStorageFile(cID, "resolv.conf"))
+	if err != nil {
+		c.Fatal(err)
+	}
+
+	if (finfo.Mode() & fmode) != fmode {
+		c.Fatalf("Expected container resolv.conf mode to be atleast %s, instead got %s", fmode.String(), finfo.Mode().String())
+	}
+}
+
+// Test if container resolv.conf gets updated the next time it restarts
+// if host /etc/resolv.conf has changed. This only applies if the container
+// uses the host's /etc/resolv.conf and does not have any dns options provided.
+func (s *DockerSuite) TestRunResolvconfUpdate(c *check.C) {
+	testRequires(c, SameHostDaemon)
 
 	tmpResolvConf := []byte("search pommesfrites.fr\nnameserver 12.34.56.78")
 	tmpLocalhostResolvConf := []byte("nameserver 127.0.0.1")
@@ -1492,7 +1490,7 @@ func (s *DockerSuite) TestRunResolvconfUpdater(c *check.C) {
 		}
 	}()
 
-	//1. test that a non-running container gets an updated resolv.conf
+	//1. test that a restarting container gets an updated resolv.conf
 	cmd = exec.Command(dockerBinary, "run", "--name='first'", "busybox", "true")
 	if _, err := runCommand(cmd); err != nil {
 		c.Fatal(err)
@@ -1508,17 +1506,26 @@ func (s *DockerSuite) TestRunResolvconfUpdater(c *check.C) {
 		c.Fatal(err)
 	}
 
-	time.Sleep(time.Second / 2)
+	// start the container again to pickup changes
+	cmd = exec.Command(dockerBinary, "start", "first")
+	if out, err := runCommand(cmd); err != nil {
+		c.Fatalf("Errored out %s, \nerror: %v", string(out), err)
+	}
+
 	// check for update in container
 	containerResolv, err := readContainerFile(containerID1, "resolv.conf")
 	if err != nil {
 		c.Fatal(err)
 	}
 	if !bytes.Equal(containerResolv, bytesResolvConf) {
-		c.Fatalf("Stopped container does not have updated resolv.conf; expected %q, got %q", tmpResolvConf, string(containerResolv))
+		c.Fatalf("Restarted container does not have updated resolv.conf; expected %q, got %q", tmpResolvConf, string(containerResolv))
 	}
 
-	//2. test that a non-running container does not receive resolv.conf updates
+	/* 	//make a change to resolv.conf (in this case replacing our tmp copy with orig copy)
+	   	if err := ioutil.WriteFile("/etc/resolv.conf", resolvConfSystem, 0644); err != nil {
+	   		c.Fatal(err)
+	   	} */
+	//2. test that a restarting container does not receive resolv.conf updates
 	//   if it modified the container copy of the starting point resolv.conf
 	cmd = exec.Command(dockerBinary, "run", "--name='second'", "busybox", "sh", "-c", "echo 'search mylittlepony.com' >>/etc/resolv.conf")
 	if _, err = runCommand(cmd); err != nil {
@@ -1528,24 +1535,26 @@ func (s *DockerSuite) TestRunResolvconfUpdater(c *check.C) {
 	if err != nil {
 		c.Fatal(err)
 	}
-	containerResolvHashBefore, err := readContainerFile(containerID2, "resolv.conf.hash")
-	if err != nil {
-		c.Fatal(err)
-	}
 
 	//make a change to resolv.conf (in this case replacing our tmp copy with orig copy)
 	if err := ioutil.WriteFile("/etc/resolv.conf", resolvConfSystem, 0644); err != nil {
 		c.Fatal(err)
 	}
 
-	time.Sleep(time.Second / 2)
-	containerResolvHashAfter, err := readContainerFile(containerID2, "resolv.conf.hash")
+	// start the container again
+	cmd = exec.Command(dockerBinary, "start", "second")
+	if out, err := runCommand(cmd); err != nil {
+		c.Fatalf("Errored out %s, \nerror: %v", string(out), err)
+	}
+
+	// check for update in container
+	containerResolv, err = readContainerFile(containerID2, "resolv.conf")
 	if err != nil {
 		c.Fatal(err)
 	}
 
-	if !bytes.Equal(containerResolvHashBefore, containerResolvHashAfter) {
-		c.Fatalf("Stopped container with modified resolv.conf should not have been updated; expected hash: %v, new hash: %v", containerResolvHashBefore, containerResolvHashAfter)
+	if bytes.Equal(containerResolv, resolvConfSystem) {
+		c.Fatalf("Restarting  a container after container updated resolv.conf should not pick up host changes; expected %q, got %q", string(containerResolv), string(resolvConfSystem))
 	}
 
 	//3. test that a running container's resolv.conf is not modified while running
@@ -1556,26 +1565,19 @@ func (s *DockerSuite) TestRunResolvconfUpdater(c *check.C) {
 	}
 	runningContainerID := strings.TrimSpace(out)
 
-	containerResolvHashBefore, err = readContainerFile(runningContainerID, "resolv.conf.hash")
-	if err != nil {
-		c.Fatal(err)
-	}
-
 	// replace resolv.conf
 	if err := ioutil.WriteFile("/etc/resolv.conf", bytesResolvConf, 0644); err != nil {
 		c.Fatal(err)
 	}
 
-	// make sure the updater has time to run to validate we really aren't
-	// getting updated
-	time.Sleep(time.Second / 2)
-	containerResolvHashAfter, err = readContainerFile(runningContainerID, "resolv.conf.hash")
+	// check for update in container
+	containerResolv, err = readContainerFile(runningContainerID, "resolv.conf")
 	if err != nil {
 		c.Fatal(err)
 	}
 
-	if !bytes.Equal(containerResolvHashBefore, containerResolvHashAfter) {
-		c.Fatalf("Running container's resolv.conf should not be updated; expected hash: %v, new hash: %v", containerResolvHashBefore, containerResolvHashAfter)
+	if bytes.Equal(containerResolv, bytesResolvConf) {
+		c.Fatalf("Running container should not have updated resolv.conf; expected %q, got %q", string(resolvConfSystem), string(containerResolv))
 	}
 
 	//4. test that a running container's resolv.conf is updated upon restart
@@ -1591,7 +1593,7 @@ func (s *DockerSuite) TestRunResolvconfUpdater(c *check.C) {
 		c.Fatal(err)
 	}
 	if !bytes.Equal(containerResolv, bytesResolvConf) {
-		c.Fatalf("Restarted container should have updated resolv.conf; expected %q, got %q", tmpResolvConf, string(containerResolv))
+		c.Fatalf("Restarted container should have updated resolv.conf; expected %q, got %q", string(bytesResolvConf), string(containerResolv))
 	}
 
 	//5. test that additions of a localhost resolver are cleaned from
@@ -1603,7 +1605,12 @@ func (s *DockerSuite) TestRunResolvconfUpdater(c *check.C) {
 		c.Fatal(err)
 	}
 
-	time.Sleep(time.Second / 2)
+	// start the container again to pickup changes
+	cmd = exec.Command(dockerBinary, "start", "first")
+	if out, err := runCommand(cmd); err != nil {
+		c.Fatalf("Errored out %s, \nerror: %v", string(out), err)
+	}
+
 	// our first exited container ID should have been updated, but with default DNS
 	// after the cleanup of resolv.conf found only a localhost nameserver:
 	containerResolv, err = readContainerFile(containerID1, "resolv.conf")
@@ -1645,7 +1652,12 @@ func (s *DockerSuite) TestRunResolvconfUpdater(c *check.C) {
 		c.Fatal(err)
 	}
 
-	time.Sleep(time.Second / 2)
+	// start the container again to pickup changes
+	cmd = exec.Command(dockerBinary, "start", "third")
+	if out, err := runCommand(cmd); err != nil {
+		c.Fatalf("Errored out %s, \nerror: %v", string(out), err)
+	}
+
 	// check for update in container
 	containerResolv, err = readContainerFile(containerID3, "resolv.conf")
 	if err != nil {
@@ -2299,7 +2311,13 @@ func (s *DockerSuite) TestRunMountOrdering(c *check.C) {
 		c.Fatal(err)
 	}
 
-	cmd := exec.Command(dockerBinary, "run", "-v", fmt.Sprintf("%s:/tmp", tmpDir), "-v", fmt.Sprintf("%s:/tmp/foo", fooDir), "-v", fmt.Sprintf("%s:/tmp/tmp2", tmpDir2), "-v", fmt.Sprintf("%s:/tmp/tmp2/foo", fooDir), "busybox:latest", "sh", "-c", "ls /tmp/touch-me && ls /tmp/foo/touch-me && ls /tmp/tmp2/touch-me && ls /tmp/tmp2/foo/touch-me")
+	cmd := exec.Command(dockerBinary, "run",
+		"-v", fmt.Sprintf("%s:/tmp", tmpDir),
+		"-v", fmt.Sprintf("%s:/tmp/foo", fooDir),
+		"-v", fmt.Sprintf("%s:/tmp/tmp2", tmpDir2),
+		"-v", fmt.Sprintf("%s:/tmp/tmp2/foo", fooDir),
+		"busybox:latest", "sh", "-c",
+		"ls /tmp/touch-me && ls /tmp/foo/touch-me && ls /tmp/tmp2/touch-me && ls /tmp/tmp2/foo/touch-me")
 	out, _, err := runCommandWithOutput(cmd)
 	if err != nil {
 		c.Fatal(out, err)
@@ -2393,41 +2411,6 @@ func (s *DockerSuite) TestVolumesNoCopyData(c *check.C) {
 	}
 }
 
-func (s *DockerSuite) TestRunVolumesNotRecreatedOnStart(c *check.C) {
-	testRequires(c, SameHostDaemon)
-
-	// Clear out any remnants from other tests
-	info, err := ioutil.ReadDir(volumesConfigPath)
-	if err != nil {
-		c.Fatal(err)
-	}
-	if len(info) > 0 {
-		for _, f := range info {
-			if err := os.RemoveAll(volumesConfigPath + "/" + f.Name()); err != nil {
-				c.Fatal(err)
-			}
-		}
-	}
-
-	cmd := exec.Command(dockerBinary, "run", "-v", "/foo", "--name", "lone_starr", "busybox")
-	if _, err := runCommand(cmd); err != nil {
-		c.Fatal(err)
-	}
-
-	cmd = exec.Command(dockerBinary, "start", "lone_starr")
-	if _, err := runCommand(cmd); err != nil {
-		c.Fatal(err)
-	}
-
-	info, err = ioutil.ReadDir(volumesConfigPath)
-	if err != nil {
-		c.Fatal(err)
-	}
-	if len(info) != 1 {
-		c.Fatalf("Expected only 1 volume have %v", len(info))
-	}
-}
-
 func (s *DockerSuite) TestRunNoOutputFromPullInStdout(c *check.C) {
 	// just run with unknown image
 	cmd := exec.Command(dockerBinary, "run", "asdfsg")
@@ -2462,7 +2445,7 @@ func (s *DockerSuite) TestRunVolumesCleanPaths(c *check.C) {
 
 	out, err = inspectFieldMap("dark_helmet", "Volumes", "/foo")
 	c.Assert(err, check.IsNil)
-	if !strings.Contains(out, volumesStoragePath) {
+	if !strings.Contains(out, volumesConfigPath) {
 		c.Fatalf("Volume was not defined for /foo\n%q", out)
 	}
 
@@ -2473,7 +2456,7 @@ func (s *DockerSuite) TestRunVolumesCleanPaths(c *check.C) {
 	}
 	out, err = inspectFieldMap("dark_helmet", "Volumes", "/bar")
 	c.Assert(err, check.IsNil)
-	if !strings.Contains(out, volumesStoragePath) {
+	if !strings.Contains(out, volumesConfigPath) {
 		c.Fatalf("Volume was not defined for /bar\n%q", out)
 	}
 }
@@ -2522,9 +2505,6 @@ func (s *DockerSuite) TestRunAllowPortRangeThroughExpose(c *check.C) {
 		if binding == nil || len(binding) != 1 || len(binding[0].HostPort) == 0 {
 			c.Fatalf("Port is not mapped for the port %d", port)
 		}
-	}
-	if err := deleteContainer(id); err != nil {
-		c.Fatal(err)
 	}
 }
 
@@ -2629,6 +2609,23 @@ func (s *DockerSuite) TestRunModeIpcContainerNotExists(c *check.C) {
 	}
 }
 
+func (s *DockerSuite) TestRunModeIpcContainerNotRunning(c *check.C) {
+	testRequires(c, SameHostDaemon)
+
+	cmd := exec.Command(dockerBinary, "create", "busybox")
+	out, _, err := runCommandWithOutput(cmd)
+	if err != nil {
+		c.Fatal(err, out)
+	}
+	id := strings.TrimSpace(out)
+
+	cmd = exec.Command(dockerBinary, "run", fmt.Sprintf("--ipc=container:%s", id), "busybox")
+	out, _, err = runCommandWithOutput(cmd)
+	if err == nil {
+		c.Fatalf("Run container with ipc mode container should fail with non running container: %s\n%s", out, err)
+	}
+}
+
 func (s *DockerSuite) TestContainerNetworkMode(c *check.C) {
 	testRequires(c, SameHostDaemon)
 
@@ -2701,7 +2698,6 @@ func (s *DockerSuite) TestRunModePidHost(c *check.C) {
 
 func (s *DockerSuite) TestRunModeUTSHost(c *check.C) {
 	testRequires(c, NativeExecDriver, SameHostDaemon)
-	defer deleteAllContainers()
 
 	hostUTS, err := os.Readlink("/proc/1/ns/uts")
 	if err != nil {
@@ -3110,7 +3106,6 @@ func (s *DockerSuite) TestRunPidHostWithChildIsKillable(c *check.C) {
 }
 
 func (s *DockerSuite) TestRunWithTooSmallMemoryLimit(c *check.C) {
-	defer deleteAllContainers()
 	// this memory limit is 1 byte less than the min, which is 4MB
 	// https://github.com/docker/docker/blob/v1.5.0/daemon/create.go#L22
 	out, _, err := runCommandWithOutput(exec.Command(dockerBinary, "run", "-m", "4194303", "busybox"))
@@ -3120,7 +3115,6 @@ func (s *DockerSuite) TestRunWithTooSmallMemoryLimit(c *check.C) {
 }
 
 func (s *DockerSuite) TestRunWriteToProcAsound(c *check.C) {
-	defer deleteAllContainers()
 	code, err := runCommand(exec.Command(dockerBinary, "run", "busybox", "sh", "-c", "echo 111 >> /proc/asound/version"))
 	if err == nil || code == 0 {
 		c.Fatal("standard container should not be able to write to /proc/asound")
@@ -3129,7 +3123,6 @@ func (s *DockerSuite) TestRunWriteToProcAsound(c *check.C) {
 
 func (s *DockerSuite) TestRunReadProcTimer(c *check.C) {
 	testRequires(c, NativeExecDriver)
-	defer deleteAllContainers()
 	out, code, err := runCommandWithOutput(exec.Command(dockerBinary, "run", "busybox", "cat", "/proc/timer_stats"))
 	if err != nil || code != 0 {
 		c.Fatal(err)
@@ -3147,7 +3140,6 @@ func (s *DockerSuite) TestRunReadProcLatency(c *check.C) {
 		c.Skip("kernel doesnt have latency_stats configured")
 		return
 	}
-	defer deleteAllContainers()
 	out, code, err := runCommandWithOutput(exec.Command(dockerBinary, "run", "busybox", "cat", "/proc/latency_stats"))
 	if err != nil || code != 0 {
 		c.Fatal(err)
@@ -3159,7 +3151,6 @@ func (s *DockerSuite) TestRunReadProcLatency(c *check.C) {
 
 func (s *DockerSuite) TestMountIntoProc(c *check.C) {
 	testRequires(c, NativeExecDriver)
-	defer deleteAllContainers()
 	code, err := runCommand(exec.Command(dockerBinary, "run", "-v", "/proc//sys", "busybox", "true"))
 	if err == nil || code == 0 {
 		c.Fatal("container should not be able to mount into /proc")
@@ -3168,9 +3159,55 @@ func (s *DockerSuite) TestMountIntoProc(c *check.C) {
 
 func (s *DockerSuite) TestMountIntoSys(c *check.C) {
 	testRequires(c, NativeExecDriver)
-	defer deleteAllContainers()
 	_, err := runCommand(exec.Command(dockerBinary, "run", "-v", "/sys/fs/cgroup", "busybox", "true"))
 	if err != nil {
 		c.Fatal("container should be able to mount into /sys/fs/cgroup")
+	}
+}
+
+func (s *DockerSuite) TestTwoContainersInNetHost(c *check.C) {
+	dockerCmd(c, "run", "-d", "--net=host", "--name=first", "busybox", "top")
+	dockerCmd(c, "run", "-d", "--net=host", "--name=second", "busybox", "top")
+	dockerCmd(c, "stop", "first")
+	dockerCmd(c, "stop", "second")
+}
+
+func (s *DockerSuite) TestRunUnshareProc(c *check.C) {
+	testRequires(c, Apparmor, NativeExecDriver)
+
+	name := "acidburn"
+	runCmd := exec.Command(dockerBinary, "run", "--name", name, "jess/unshare", "unshare", "-p", "-m", "-f", "-r", "--mount-proc=/proc", "mount")
+	if out, _, err := runCommandWithOutput(runCmd); err == nil || !strings.Contains(out, "Permission denied") {
+		c.Fatalf("unshare should have failed with permission denied, got: %s, %v", out, err)
+	}
+
+	name = "cereal"
+	runCmd = exec.Command(dockerBinary, "run", "--name", name, "jess/unshare", "unshare", "-p", "-m", "-f", "-r", "mount", "-t", "proc", "none", "/proc")
+	if out, _, err := runCommandWithOutput(runCmd); err == nil || !strings.Contains(out, "Permission denied") {
+		c.Fatalf("unshare should have failed with permission denied, got: %s, %v", out, err)
+	}
+}
+
+func (s *DockerSuite) TestRunPublishPort(c *check.C) {
+	out, _, err := runCommandWithOutput(exec.Command(dockerBinary, "run", "-d", "--name", "test", "--expose", "8080", "busybox", "top"))
+	c.Assert(err, check.IsNil)
+	out, _, err = runCommandWithOutput(exec.Command(dockerBinary, "port", "test"))
+	c.Assert(err, check.IsNil)
+	out = strings.Trim(out, "\r\n")
+	if out != "" {
+		c.Fatalf("run without --publish-all should not publish port, out should be nil, but got: %s", out)
+	}
+}
+
+// Issue #10184.
+func (s *DockerSuite) TestDevicePermissions(c *check.C) {
+	testRequires(c, NativeExecDriver)
+	const permissions = "crw-rw-rw-"
+	out, status := dockerCmd(c, "run", "--device", "/dev/fuse:/dev/fuse:mrw", "busybox:latest", "ls", "-l", "/dev/fuse")
+	if status != 0 {
+		c.Fatalf("expected status 0, got %d", status)
+	}
+	if !strings.HasPrefix(out, permissions) {
+		c.Fatalf("output should begin with %q, got %q", permissions, out)
 	}
 }

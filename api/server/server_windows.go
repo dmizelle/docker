@@ -7,27 +7,22 @@ import (
 	"net"
 	"net/http"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/daemon"
 )
 
 // NewServer sets up the required Server and does protocol specific checking.
-func (s *Server) newServer(proto, addr string) (Server, error) {
+func (s *Server) newServer(proto, addr string) (serverCloser, error) {
 	var (
 		err error
 		l   net.Listener
 	)
 	switch proto {
 	case "tcp":
-		if !s.cfg.TlsVerify {
-			logrus.Warn("/!\\ DON'T BIND ON ANY IP ADDRESS WITHOUT setting -tlsverify IF YOU DON'T KNOW WHAT YOU'RE DOING /!\\")
-		}
-		if l, err = NewTcpSocket(addr, tlsConfigFromServerConfig(s.cfg)); err != nil {
+		l, err = s.initTcpSocket(addr)
+		if err != nil {
 			return nil, err
 		}
-		if err := allocateDaemonPort(addr); err != nil {
-			return nil, err
-		}
+
 	default:
 		return nil, errors.New("Invalid protocol format. Windows only supports tcp.")
 	}
@@ -48,4 +43,11 @@ func (s *Server) AcceptConnections(d *daemon.Daemon) {
 	default:
 		close(s.start)
 	}
+}
+
+func allocateDaemonPort(addr string) error {
+	return nil
+}
+
+func adjustCpuShares(version version.Version, hostConfig *runconfig.HostConfig) {
 }

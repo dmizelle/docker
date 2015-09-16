@@ -7,17 +7,18 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
-	"runtime"
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/docker/docker/daemon/graphdriver"
 	"github.com/docker/docker/pkg/mount"
 	"github.com/docker/docker/pkg/parsers"
+	"github.com/docker/libcontainer/label"
 	zfs "github.com/mistifyio/go-zfs"
 )
 
@@ -165,7 +166,7 @@ type Driver struct {
 	options          ZfsOptions
 	sync.Mutex       // protects filesystem cache against concurrent access
 	filesystemsCache map[string]bool
-	mountedFs 			 map[string]int
+	mountedFs        map[string]int
 }
 
 func (d *Driver) String() string {
@@ -233,18 +234,18 @@ func (d *Driver) ZfsPath(id string) string {
 }
 
 func (d *Driver) MountPath(id string) string {
-	newid := id;
+	newid := id
 
 	// on freebsd mount path is limited with 88 chars, so we need to use short ids
-  if(runtime.GOOS == "freebsd") {
+	if runtime.GOOS == "freebsd" {
 		suffix := strings.SplitN(id, "-", 2)
-	
-		if(len(suffix) == 1) {// no tag
+
+		if len(suffix) == 1 { // no tag
 			newid = id[0:12]
-		} else { 
+		} else {
 			newid = id[0:12] + "-" + suffix[1]
 		}
-  }   
+	}
 
 	return path.Join(d.options.mountPath, "graph", newid)
 }
@@ -304,16 +305,18 @@ func (d *Driver) Remove(id string) error {
 func (d *Driver) Get(id, mountLabel string) (string, error) {
 	mountpoint := d.MountPath(id)
 	filesystem := d.ZfsPath(id)
+	options := label.FormatMountLabel("", mountLabel)
 
-	if(d.mountedFs[filesystem] == 0) {
-		log.Debugf(`[zfs] mount("%s", "%s", "%s")`, filesystem, mountpoint, mountLabel)
+	log.Debugf(`[zfs] mount("%s", "%s", "%s")`, filesystem, mountpoint, options)
+
+	if d.mountedFs[filesystem] == 0 {
 
 		// Create the target directories if they don't exist
 		if err := os.MkdirAll(mountpoint, 0755); err != nil && !os.IsExist(err) {
 			return "", err
 		}
 
-		err := mount.Mount(filesystem, mountpoint, "zfs", mountLabel)
+		err := mount.Mount(filesystem, mountpoint, "zfs", options)
 		if err != nil {
 			return "", fmt.Errorf("error creating zfs mount of %s to %s: %v", filesystem, mountpoint, err)
 		}
@@ -332,7 +335,7 @@ func (d *Driver) Put(id string) error {
 	mountpoint := d.MountPath(id)
 	name := d.ZfsPath(id)
 
-	if(d.mountedFs[name] == 1) {
+	if d.mountedFs[name] == 1 {
 		log.Debugf(`[zfs] unmount("%s")`, mountpoint)
 
 		if err := mount.Unmount(mountpoint); err != nil {

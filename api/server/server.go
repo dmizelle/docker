@@ -23,7 +23,6 @@ import (
 	"github.com/docker/docker/builder"
 	"github.com/docker/docker/cliconfig"
 	"github.com/docker/docker/daemon"
-	"github.com/docker/docker/daemon/networkdriver/bridge"
 	"github.com/docker/docker/graph"
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/docker/pkg/jsonmessage"
@@ -31,6 +30,7 @@ import (
 	"github.com/docker/docker/pkg/parsers/filters"
 	"github.com/docker/docker/pkg/parsers/kernel"
 	"github.com/docker/docker/pkg/signal"
+	"github.com/docker/docker/pkg/sockets"
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/docker/docker/pkg/streamformatter"
 	"github.com/docker/docker/pkg/version"
@@ -96,15 +96,17 @@ func (s *Server) ServeApi(protoAddrs []string) error {
 		if err != nil {
 			return err
 		}
-		s.servers = append(s.servers, srv)
+		s.servers = append(s.servers, srv...)
 
-		go func(proto, addr string) {
-			logrus.Infof("Listening for HTTP on %s (%s)", proto, addr)
-			if err := srv.Serve(); err != nil && strings.Contains(err.Error(), "use of closed network connection") {
-				err = nil
-			}
-			chErrors <- err
-		}(protoAddrParts[0], protoAddrParts[1])
+		for _, s := range srv {
+			logrus.Infof("Listening for HTTP on %s (%s)", protoAddrParts[0], protoAddrParts[1])
+			go func(s serverCloser) {
+				if err := s.Serve(); err != nil && strings.Contains(err.Error(), "use of closed network connection") {
+					err = nil
+				}
+				chErrors <- err
+			}(s)
+		}
 	}
 
 	for i := 0; i < len(protoAddrs); i++ {
@@ -243,8 +245,6 @@ func (s *Server) postAuth(version version.Version, w http.ResponseWriter, r *htt
 }
 
 func (s *Server) getVersion(version version.Version, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
-	w.Header().Set("Content-Type", "application/json")
-
 	v := &types.Version{
 		Version:    dockerversion.VERSION,
 		ApiVersion: api.APIVERSION,
@@ -253,6 +253,11 @@ func (s *Server) getVersion(version version.Version, w http.ResponseWriter, r *h
 		Os:         runtime.GOOS,
 		Arch:       runtime.GOARCH,
 	}
+
+	if version.GreaterThanOrEqualTo("1.19") {
+		v.Experimental = utils.ExperimentalBuild()
+	}
+
 	if kernelVersion, err := kernel.GetKernelVersion(); err == nil {
 		v.KernelVersion = kernelVersion.String()
 	}
@@ -272,14 +277,20 @@ func (s *Server) postContainersKill(version version.Version, w http.ResponseWrit
 	name := vars["name"]
 
 	// If we have a signal, look at it. Otherwise, do nothing
-	if sigStr := vars["signal"]; sigStr != "" {
+	if sigStr := r.Form.Get("signal"); sigStr != "" {
 		// Check if we passed the signal as a number:
 		// The largest legal signal is 31, so let's parse on 5 bits
-		sig, err := strconv.ParseUint(sigStr, 10, 5)
+		sigN, err := strconv.ParseUint(sigStr, 10, 5)
 		if err != nil {
 			// The signal is not a number, treat it as a string (either like
 			// "KILL" or like "SIGKILL")
-			sig = uint64(signal.SignalMap[strings.TrimPrefix(sigStr, "SIG")])
+			syscallSig, ok := signal.SignalMap[strings.TrimPrefix(sigStr, "SIG")]
+			if !ok {
+				return fmt.Errorf("Invalid signal: %s", sigStr)
+			}
+			sig = uint64(syscallSig)
+		} else {
+			sig = sigN
 		}
 
 		if sig == 0 {
@@ -358,8 +369,6 @@ func (s *Server) getImagesJSON(version version.Version, w http.ResponseWriter, r
 }
 
 func (s *Server) getInfo(version version.Version, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
-	w.Header().Set("Content-Type", "application/json")
-
 	info, err := s.daemon.SystemInfo()
 	if err != nil {
 		return err
@@ -389,6 +398,7 @@ func (s *Server) getEvents(version version.Version, w http.ResponseWriter, r *ht
 		}
 		until = u
 	}
+
 	timer := time.NewTimer(0)
 	timer.Stop()
 	if until > 0 {
@@ -447,6 +457,9 @@ func (s *Server) getEvents(version version.Version, w http.ResponseWriter, r *ht
 	}
 
 	current, l := es.Subscribe()
+	if since == -1 {
+		current = nil
+	}
 	defer es.Evict(l)
 	for _, ev := range current {
 		if ev.Time < since {
@@ -456,6 +469,12 @@ func (s *Server) getEvents(version version.Version, w http.ResponseWriter, r *ht
 			return err
 		}
 	}
+
+	var closeNotify <-chan bool
+	if closeNotifier, ok := w.(http.CloseNotifier); ok {
+		closeNotify = closeNotifier.CloseNotify()
+	}
+
 	for {
 		select {
 		case ev := <-l:
@@ -467,6 +486,9 @@ func (s *Server) getEvents(version version.Version, w http.ResponseWriter, r *ht
 				return err
 			}
 		case <-timer.C:
+			return nil
+		case <-closeNotify:
+			logrus.Debug("Client disconnected, stop sending events")
 			return nil
 		}
 	}
@@ -553,7 +575,16 @@ func (s *Server) getContainersStats(version version.Version, w http.ResponseWrit
 		return fmt.Errorf("Missing parameter")
 	}
 
-	return s.daemon.ContainerStats(vars["name"], boolValue(r, "stream"), ioutils.NewWriteFlusher(w))
+	stream := boolValueOrDefault(r, "stream", true)
+	var out io.Writer
+	if !stream {
+		w.Header().Set("Content-Type", "application/json")
+		out = w
+	} else {
+		out = ioutils.NewWriteFlusher(w)
+	}
+
+	return s.daemon.ContainerStats(vars["name"], stream, out)
 }
 
 func (s *Server) getContainersLogs(version version.Version, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
@@ -635,10 +666,6 @@ func (s *Server) postCommit(version version.Version, w http.ResponseWriter, r *h
 	c, _, err := runconfig.DecodeContainerConfig(r.Body)
 	if err != nil && err != io.EOF { //Do not fail if body is empty.
 		return err
-	}
-
-	if c == nil {
-		c = &runconfig.Config{}
 	}
 
 	containerCommitConfig := &daemon.ContainerCommitConfig{
@@ -862,7 +889,7 @@ func (s *Server) postImagesLoad(version version.Version, w http.ResponseWriter, 
 
 func (s *Server) postContainersCreate(version version.Version, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
 	if err := parseForm(r); err != nil {
-		return nil
+		return err
 	}
 	if err := checkForJson(r); err != nil {
 		return err
@@ -876,6 +903,7 @@ func (s *Server) postContainersCreate(version version.Version, w http.ResponseWr
 	if err != nil {
 		return err
 	}
+	adjustCpuShares(version, hostConfig)
 
 	containerId, warnings, err := s.daemon.ContainerCreate(name, config, hostConfig)
 	if err != nil {
@@ -1136,6 +1164,14 @@ func (s *Server) getContainersByName(version version.Version, w http.ResponseWri
 		return fmt.Errorf("Missing parameter")
 	}
 
+	if version.LessThan("1.19") {
+		containerJSONRaw, err := s.daemon.ContainerInspectRaw(vars["name"])
+		if err != nil {
+			return err
+		}
+		return writeJSON(w, http.StatusOK, containerJSONRaw)
+	}
+
 	containerJSON, err := s.daemon.ContainerInspect(vars["name"])
 	if err != nil {
 		return err
@@ -1287,7 +1323,7 @@ func (s *Server) postContainersCopy(version version.Version, w http.ResponseWrit
 
 func (s *Server) postContainerExecCreate(version version.Version, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
 	if err := parseForm(r); err != nil {
-		return nil
+		return err
 	}
 	name := vars["name"]
 
@@ -1316,7 +1352,7 @@ func (s *Server) postContainerExecCreate(version version.Version, w http.Respons
 // TODO(vishh): Refactor the code to avoid having to specify stream config as part of both create and start.
 func (s *Server) postContainerExecStart(version version.Version, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
 	if err := parseForm(r); err != nil {
-		return nil
+		return err
 	}
 	var (
 		execName = vars["name"]
@@ -1402,6 +1438,26 @@ func (s *Server) ping(version version.Version, w http.ResponseWriter, r *http.Re
 	return err
 }
 
+func (s *Server) initTcpSocket(addr string) (l net.Listener, err error) {
+	if !s.cfg.TlsVerify {
+		logrus.Warn("/!\\ DON'T BIND ON ANY IP ADDRESS WITHOUT setting -tlsverify IF YOU DON'T KNOW WHAT YOU'RE DOING /!\\")
+	}
+
+	var c *sockets.TlsConfig
+	if s.cfg.Tls || s.cfg.TlsVerify {
+		c = sockets.NewTlsConfig(s.cfg.TlsCert, s.cfg.TlsKey, s.cfg.TlsCa, s.cfg.TlsVerify)
+	}
+
+	if l, err = sockets.NewTcpSocket(addr, c, s.start); err != nil {
+		return nil, err
+	}
+	if err := allocateDaemonPort(addr); err != nil {
+		return nil, err
+	}
+
+	return
+}
+
 func makeHttpHandler(logging bool, localMethod string, localRoute string, handlerFunc HttpApiFunc, corsHeaders string, dockerVersion version.Version) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// log the request
@@ -1426,7 +1482,7 @@ func makeHttpHandler(logging bool, localMethod string, localRoute string, handle
 		}
 
 		if version.GreaterThan(api.APIVERSION) {
-			http.Error(w, fmt.Errorf("client and server don't have same version (client API version: %s, server API version: %s)", version, api.APIVERSION).Error(), http.StatusNotFound)
+			http.Error(w, fmt.Errorf("client and server don't have same version (client API version: %s, server API version: %s)", version, api.APIVERSION).Error(), http.StatusBadRequest)
 			return
 		}
 
@@ -1528,30 +1584,4 @@ func createRouter(s *Server) *mux.Router {
 	}
 
 	return r
-}
-
-func allocateDaemonPort(addr string) error {
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return err
-	}
-
-	intPort, err := strconv.Atoi(port)
-	if err != nil {
-		return err
-	}
-
-	var hostIPs []net.IP
-	if parsedIP := net.ParseIP(host); parsedIP != nil {
-		hostIPs = append(hostIPs, parsedIP)
-	} else if hostIPs, err = net.LookupIP(host); err != nil {
-		return fmt.Errorf("failed to lookup %s address in host specification", host)
-	}
-
-	for _, hostIP := range hostIPs {
-		if _, err := bridge.RequestPort(hostIP, "tcp", intPort); err != nil {
-			return fmt.Errorf("failed to allocate daemon listening port %d (err: %v)", intPort, err)
-		}
-	}
-	return nil
 }

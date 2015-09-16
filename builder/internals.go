@@ -561,6 +561,7 @@ func (b *Builder) create() (*daemon.Container, error) {
 		CgroupParent: b.cgroupParent,
 		Memory:       b.memory,
 		MemorySwap:   b.memorySwap,
+		NetworkMode:  "bridge",
 	}
 
 	config := *b.Config
@@ -763,16 +764,14 @@ func fixPermissions(source, destination string, uid, gid int, destExisted bool) 
 
 func (b *Builder) clearTmp() {
 	for c := range b.TmpContainers {
-		tmp, err := b.Daemon.Get(c)
-		if err != nil {
-			fmt.Fprint(b.OutStream, err.Error())
+		rmConfig := &daemon.ContainerRmConfig{
+			ForceRemove:  true,
+			RemoveVolume: true,
 		}
-
-		if err := b.Daemon.Rm(tmp); err != nil {
+		if err := b.Daemon.ContainerRm(c, rmConfig); err != nil {
 			fmt.Fprintf(b.OutStream, "Error removing intermediate container %s: %v\n", stringid.TruncateID(c), err)
 			return
 		}
-		b.Daemon.DeleteVolumes(tmp.VolumePaths())
 		delete(b.TmpContainers, c)
 		fmt.Fprintf(b.OutStream, "Removing intermediate container %s\n", stringid.TruncateID(c))
 	}

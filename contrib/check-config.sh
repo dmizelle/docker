@@ -26,6 +26,12 @@ fi
 is_set() {
 	zgrep "CONFIG_$1=[y|m]" "$CONFIG" > /dev/null
 }
+is_set_in_kernel() {
+	zgrep "CONFIG_$1=y" "$CONFIG" > /dev/null
+}
+is_set_as_module() {
+	zgrep "CONFIG_$1=m" "$CONFIG" > /dev/null
+}
 
 # see https://en.wikipedia.org/wiki/ANSI_escape_code#Colors
 declare -A colors=(
@@ -70,8 +76,10 @@ wrap_warning() {
 }
 
 check_flag() {
-	if is_set "$1"; then
+	if is_set_in_kernel "$1"; then
 		wrap_good "CONFIG_$1" 'enabled'
+	elif is_set_as_module "$1"; then
+		wrap_good "CONFIG_$1" 'enabled (as module)'
 	else
 		wrap_bad "CONFIG_$1" 'missing'
 	fi
@@ -155,7 +163,7 @@ flags=(
 	NAMESPACES {NET,PID,IPC,UTS}_NS
 	DEVPTS_MULTIPLE_INSTANCES
 	CGROUPS CGROUP_CPUACCT CGROUP_DEVICE CGROUP_FREEZER CGROUP_SCHED CPUSETS
-	MACVLAN VETH BRIDGE
+	MACVLAN VETH BRIDGE BRIDGE_NETFILTER
 	NF_NAT_IPV4 IP_NF_FILTER IP_NF_TARGET_MASQUERADE
 	NETFILTER_XT_MATCH_{ADDRTYPE,CONNTRACK}
 	NF_NAT NF_NAT_NEEDED
@@ -176,6 +184,8 @@ echo 'Optional Features:'
 }
 flags=(
 	RESOURCE_COUNTERS
+	BLK_CGROUP
+	IOSCHED_CFQ
 	CGROUP_PERF
 	CFS_BANDWIDTH
 )

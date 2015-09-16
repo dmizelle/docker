@@ -133,6 +133,21 @@ do_install() {
 			exit 0
 			;;
 
+		'opensuse project'|opensuse|'suse linux'|sled)
+			(
+				set -x
+				$sh_c 'sleep 3; zypper -n install docker'
+			)
+			if command_exists docker && [ -e /var/run/docker.sock ]; then
+				(
+					set -x
+					$sh_c 'docker version'
+				) || true
+			fi
+			echo_docker_as_nonroot
+			exit 0
+			;;
+
 		ubuntu|debian|linuxmint|'elementary os'|kali)
 			export DEBIAN_FRONTEND=noninteractive
 
@@ -192,6 +207,8 @@ do_install() {
 					$sh_c "apt-key adv --keyserver hkp://p80.pool.sks-keyservers.net:80 --recv-keys 36A1D7869245C8950F966E92D8576A8BA88D21E9"
 				elif [ "https://test.docker.com/" = "$url" ]; then
 					$sh_c "apt-key adv --keyserver hkp://p80.pool.sks-keyservers.net:80 --recv-keys 740B314AE3941731B942C66ADF4FD13717AAD7D6"
+				elif [ "https://experimental.docker.com/" = "$url" ]; then
+					$sh_c "apt-key adv --keyserver hkp://p80.pool.sks-keyservers.net:80 --recv-keys E33FF7BF5C91D50A6F91FFFD4CC38D40F9A96B49"
 				else
 					$sh_c "$curl ${url}gpg | apt-key add -"
 				fi
